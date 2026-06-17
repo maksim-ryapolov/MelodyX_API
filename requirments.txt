@@ -1,0 +1,14 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
+httpx==0.28.1
+pydantic==2.10.6
+openai==1.63.2
+redis==5.2.1
+aiosqlite==0.20.0
+aiofiles==24.1.0
+PyJWT==2.10.1
+python-jose[cryptography]==3.3.0
+google-auth==2.38.0
+google-auth-oauthlib==1.2.1
+requests==2.32.3
