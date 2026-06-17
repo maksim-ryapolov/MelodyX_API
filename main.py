@@ -28,6 +28,7 @@ async def get_redis()->Redis:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await aiosqlite.connect(database="melodyx.db")
+    await app.state.db.execute("""PRAGMA foreign_keys = ON""")
     await app.state.db.execute("""
         CREATE TABLE IF NOT EXISTS users (
                sub TEXT PRIMARY KEY,
@@ -64,7 +65,7 @@ async def lifespan(app: FastAPI):
     await app.state.db.close()
 
 
-auth_scheme = OAuth2PasswordBearer(tokenUrl="/auth/google")
+auth_scheme = OAuth2PasswordBearer(tokenUrl="/auth/google/")
 async def get_user(token: str=Depends(auth_scheme)):
     if secret:
         bytes_s = base64.b64decode(secret)
@@ -113,6 +114,7 @@ class TrackResponse(BaseModel):
     cover_url: str
     user_id: str
     genre: str
+    is_liked: bool
     color: str
     optimized_prompt: str
     track_url: str 
@@ -151,7 +153,7 @@ async def search(deepseek_response, id):
         print(repr(e))
         deepseek_response["cover_url"] = None
     return deepseek_response
-async def gen_music(deepseek_response, id, redis):
+async def gen_music(deepseek_response, id, redis, db, user):
     try:
         async with httpx.AsyncClient(timeout=120.0) as http_client:
             if deepseek_response.get("lyrics") is not None and (len(deepseek_response.get("lyrics")) < 20 or "duration" in deepseek_response.get("optimized_prompt")):
@@ -257,6 +259,20 @@ async def gen_music(deepseek_response, id, redis):
         await redis.hset(name=f"tasks:{id}", key="status",value="failed")
         print(e)
     
+    data = await redis.hgetall(f"tasks:{id}")
+    await redis.expire(f"tasks:{id}", 3000)
+    if data:
+        data["meta"] = json.loads(data["meta"])
+        task = TaskStatusResponse.model_validate(data)
+        task =  task.model_dump()
+        if task["status"] == "success":
+            await db.execute("""
+            INSERT INTO tracks (id, user_id, name, cover_url, genre, color, track_url, optimized_prompt) SELECT
+            ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE id = ?)
+
+            """, (id, user, task["meta"]["track_name"], task["meta"]["cover_url"], task["meta"]["genre"], task["meta"]["color"], task["audio_url"], task["meta"]["optimized_prompt"], id)
+            )
+            await db.commit()
     
 async def get_response(input_prompt: Prompt, id, client, duration: str="15"):
     prompt = input_prompt.model_dump()
@@ -298,7 +314,7 @@ async def get_response(input_prompt: Prompt, id, client, duration: str="15"):
 
 
 @app.post("/api/generate")
-async def generate(background_tasks: BackgroundTasks, input_prompt: Prompt, duration: str="15", client=Depends(get_client), redis=Depends(get_redis)):
+async def generate(background_tasks: BackgroundTasks, input_prompt: Prompt, duration: str="15", client=Depends(get_client), redis=Depends(get_redis), db=Depends(get_db), user=Depends(get_user)):
     task_id: str = str(uuid.uuid4())
     response = await get_response(input_prompt, task_id, client, duration)
     meta = {
@@ -311,7 +327,7 @@ async def generate(background_tasks: BackgroundTasks, input_prompt: Prompt, dura
     await redis.hset(name=f"tasks:{task_id}", key="status", value="processing")
     await redis.hset(name=f"tasks:{task_id}", key="audio_url", value="") 
     await redis.hset(name=f"tasks:{task_id}", key="meta", value=json.dumps(meta)) 
-    background_tasks.add_task(gen_music, response, task_id, redis)
+    background_tasks.add_task(gen_music, response, task_id, redis, db, user)
     return {
         "task_id": task_id,
         "status": "processing",
@@ -320,21 +336,13 @@ async def generate(background_tasks: BackgroundTasks, input_prompt: Prompt, dura
     
     
 @app.get("/api/status/{task_id}")
-async def return_status(task_id, db=Depends(get_db), user=Depends(get_user)):
+async def return_status(task_id):
     data = await redis.hgetall(f"tasks:{task_id}")
     await redis.expire(f"tasks:{task_id}", 300)
     if data:
         data["meta"] = json.loads(data["meta"])
         task = TaskStatusResponse.model_validate(data)
         task =  task.model_dump()
-        if task["status"] == "success":
-            await db.execute("""
-            INSERT INTO tracks (id, user_id, name, cover_url, genre, color, track_url, optimized_prompt) SELECT
-            (?, ?, ?, ?, ?, ?, ?, ?) WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE id = ?)
-
-            """, (task_id, user, task["meta"]["track_name"], task["meta"]["cover_url"], task["meta"]["genre"], task["meta"]["color"], task["audio_url"], task["meta"]["optimized_prompt"], task_id)
-            )
-            await db.commit()
         return task
         
     raise HTTPException(status_code=404)
@@ -345,7 +353,8 @@ async def google_auth(data: GoogleToken, db=Depends(get_db)):
     try:
         id_inf = id_token.verify_oauth2_token(token, requests.Request(), client_id)
     except Exception as e:
-        return {"exception": str(e)}
+        print(e)
+        return {"status": "failed"}
     user_id = id_inf["sub"]
     email = id_inf["email"]
     name = id_inf["name"]
@@ -423,7 +432,7 @@ async def get_tracks(user=Depends(get_user), db=Depends(get_db)):
         })
     return resp
 @app.post("/upd/history")
-async def upd_hi(track_id, user=Depends(get_user), db=Depends(get_db)):
+async def upd_hi(track_id: str, user=Depends(get_user), db=Depends(get_db)):
     await db.execute("""
         INSERT INTO history (id, user_id, track_id) VALUES (?, ?, ?)
     """, (str(uuid.uuid4()), user, track_id))
@@ -447,7 +456,7 @@ async def get_hi(user=Depends(get_user), db=Depends(get_db)):
         id_list.append(id[0])
     return {"history": id_list}
 @app.patch("/like")
-async def like(track_id, db=Depends(get_db), user=Depends(get_user)):
+async def like(track_id: str, db=Depends(get_db), user=Depends(get_user)):
     await db.execute("""
         UPDATE tracks SET is_liked = CASE
                      WHEN is_liked = false THEN true
@@ -455,3 +464,19 @@ async def like(track_id, db=Depends(get_db), user=Depends(get_user)):
                 END
                 WHERE id = ? AND user_id = ?
     """, (track_id, user))
+    await db.commit()
+
+@app.delete("/del/track")
+async def delete_track(track_id: str, user=Depends(get_user), db=Depends(get_db)):
+    await db.execute("""DELETE FROM tracks WHERE id = ? AND user_id = ?
+            """, (track_id, user))
+    await db.commit()
+
+@app.get("/user/info")
+async def get_info(user=Depends(get_user), db=Depends(get_db)):
+    cursor = await db.execute("""SELECT * FROM users WHERE users.sub = ?""", (user,))
+    row = await cursor.fetchone()
+    if row:
+        sub,name,email,billing_plan = row
+        return {"sub": sub, "email": email, "billing_plan": billing_plan, "name": name}
+    raise HTTPException(status_code=404)
