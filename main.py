@@ -13,12 +13,17 @@ import aiosqlite
 from fastapi.security import OAuth2PasswordBearer
 from google.oauth2 import id_token
 from google.auth.transport import requests
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 dotenv.load_dotenv()
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 minimax_api_key = os.getenv("MINIMAX_API_KEY")
+minimax_api_key1 = os.getenv("MINIMAX_API_KEY1")
 pexels_api_key = os.getenv("PEXELS_API_KEY")
 client_id = os.getenv("CL_ID")
+replicate = os.getenv("R_TOKEN")
 secret = os.getenv("SECRET")
 proxy = os.getenv("PROXY")
 
@@ -34,7 +39,8 @@ async def lifespan(app: FastAPI):
                sub TEXT PRIMARY KEY,
                name TEXT,
                email TEXT,
-               billing_plan TEXT
+               billing_plan TEXT,
+               billing_expire TIMESTAMP
     );"""
     )
     await app.state.db.execute("""
@@ -64,7 +70,8 @@ async def lifespan(app: FastAPI):
     yield
     await app.state.db.close()
 
-
+def get_db(request: Request):
+    return request.app.state.db
 auth_scheme = OAuth2PasswordBearer(tokenUrl="/auth/google/")
 async def get_user(token: str=Depends(auth_scheme)):
     if secret:
@@ -87,13 +94,15 @@ client = AsyncOpenAI(
 )
 app = FastAPI(lifespan=lifespan)
 
-def get_db(request: Request):
-    return request.app.state.db
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 async def get_client()->AsyncOpenAI:
     return client
 class Prompt(BaseModel):
     content: str
+    model: int
 class DeepseekGenResponse(BaseModel):
     optimized_prompt: str 
     color: str 
@@ -153,40 +162,38 @@ async def search(deepseek_response, id):
         print(repr(e))
         deepseek_response["cover_url"] = None
     return deepseek_response
-async def gen_music(deepseek_response, id, redis, db, user):
+async def gen_music(deepseek_response, id, model, redis, db, user):
     try:
-        async with httpx.AsyncClient(timeout=120.0) as http_client:
-            if deepseek_response.get("lyrics") is not None and (len(deepseek_response.get("lyrics")) < 20 or "duration" in deepseek_response.get("optimized_prompt")):
-                if "duration" in deepseek_response.get("optimized_prompt") and len(deepseek_response.get("lyrics")) > 21:
-                    deepseek_response["lyrics"] = ""
-
+        proxy_req = f"http://{proxy}@196.19.120.153:8000"
+        async with httpx.AsyncClient(timeout=210.0, proxy=proxy_req) as http_client:
+            if model == 0:
                 payload = {
                     "prompt": deepseek_response.get("optimized_prompt"),
+                    "lyrics": deepseek_response.get("lyrics"),
                     "audio_duration":  deepseek_response.get("duration"),
                     "inference_steps": 8,
                     "thinking": False,
-                    "use_cot_caption": False,
-                    "use_cot_language": False,
-                    "offload_to_cpu": True,
-                    "batch_size": 1,
                     "audio_format": "wav"
                 }
-                url = "http://127.0.0.1:8001/release_task"
+                headers = {
+                    "Content-Type": "application/json"
+                }
+                url = "https://humbly-probable-whiting.cloudpub.ru/release_task"
             
-                request = await http_client.post(url, json=payload)
+                request = await http_client.post(url, json=payload, headers=headers)
                 acestep_resp = request.json()
                 idd = acestep_resp["data"]["task_id"]
 
                 for _ in range(20):
                     await asyncio.sleep(3)
-                    url = "http://127.0.0.1:8001/query_result"
+                    url = "https://humbly-probable-whiting.cloudpub.ru/query_result"
                     pld = {
                         "task_id_list": [idd]
                     }
                     request = await http_client.post(url, json=pld)
                     result = request.json()
                     if result["data"][0]["status"] == 1:
-                        await redis.hset(name=f"tasks:{id}", key="audio_url", value=f"http://127.0.0.1:8001{json.loads(result['data'][0]['result'])[0]['file']}") 
+                        await redis.hset(name=f"tasks:{id}", key="audio_url", value=f"https://humbly-probable-whiting.cloudpub.ru{json.loads(result['data'][0]['result'])[0]['file']}") 
                         await redis.hset(name=f"tasks:{id}", key="status",value="success")
                         break
                     elif result["data"][0]["status"] != 1:
@@ -194,11 +201,10 @@ async def gen_music(deepseek_response, id, redis, db, user):
                         continue
                 else:
                     await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-        
-            else:
+            elif model == 1:
                 headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {minimax_api_key}"
+                "Authorization": f"Bearer {minimax_api_key1}"
                 }
                 payload = {
                 "prompt": deepseek_response.get("optimized_prompt"),
@@ -219,7 +225,6 @@ async def gen_music(deepseek_response, id, redis, db, user):
                 if request.status_code != 200:
                     await redis.hset(name=f"tasks:{id}", key="status",value="failed")
                     await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                    return
                 else:
                     mm_task_id = minimax_response.get("request_id")
                     url_status = f"https://api.gen-api.ru/api/v1/request/get/{mm_task_id}"
@@ -242,6 +247,85 @@ async def gen_music(deepseek_response, id, redis, db, user):
                     else:
                         await redis.hset(name=f"tasks:{id}", key="status",value="failed")
                         return
+                    
+            elif model == 2:
+                headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {minimax_api_key}"
+                }
+                payload = {
+                "model": "music-2.6",
+                "prompt": deepseek_response.get("optimized_prompt"),
+                "lyrics": deepseek_response.get("lyrics"),
+                "output_format": "url",
+                "audio_settings": {
+                    "sample_rate": 44100,
+                    "bitrate": 256000,
+                    "format": "mp3",
+                    "translate_input": False
+                    }
+                }
+                url = "https://api.minimax.io/v1/music_generation"
+        
+                request = await http_client.post(url, headers=headers, json=payload)
+                minimax_response = request.json()
+                print(request.status_code)
+                print(minimax_response)
+                
+                if request.status_code != 200:
+                    await redis.hset(name=f"tasks:{id}", key="status",value="failed")
+                    await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
+                    return
+                else:
+                    
+                    if minimax_response.get("data")["status"] == 2:
+                        
+                        await redis.hset(name=f"tasks:{id}", key="audio_url", value=minimax_response.get("data")["audio"])
+                        await redis.hset(name=f"tasks:{id}", key="status",value="success")
+                    else:
+                        await redis.hset(name=f"tasks:{id}", key="status",value="failed")
+                        await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
+            elif model == 3:
+                headers = {
+                "Authorization": f"Bearer {replicate}",
+                "Content-Type": "application/json"
+                }
+                payload = {
+                    "input": {
+                        "prompt": deepseek_response.get("optimized_prompt")
+                    }
+                }
+                url = "https://api.replicate.com/v1/models/google/lyria-3-pro/predictions"
+                request = await http_client.post(url, headers=headers, json=payload)
+                lyr_response = request.json()
+                print(request.status_code)
+                print(lyr_response)
+                
+                if request.status_code != 200 and request.status_code != 201:
+                    await redis.hset(name=f"tasks:{id}", key="status",value="failed")
+                    await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
+                else:
+                    l_task_id = lyr_response.get("id")
+                    url_status = f"https://api.replicate.com/v1/predictions/{l_task_id}"
+                    for _ in range(20):
+                        await asyncio.sleep(5)
+                        request = await http_client.get(url_status, headers=headers)
+                        lyr_response = request.json()
+                        if lyr_response.get("status") == "succeeded":
+                            await redis.hset(name=f"tasks:{id}", key="audio_url", value=lyr_response.get("output"))
+                            await redis.hset(name=f"tasks:{id}", key="status",value="success")
+                            print(lyr_response)
+                            break
+                        elif request.status_code != 200 and request.status_code != 201:
+                            print(request.status_code)
+                            print(lyr_response)
+                            await redis.hset(name=f"tasks:{id}", key="status",value="failed")
+                            await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
+                            return
+                    else:
+                        await redis.hset(name=f"tasks:{id}", key="status",value="failed")
+                        return
+                    
             final_gen = await redis.hget(name=f"tasks:{id}", key="audio_url")
                         
             if final_gen:
@@ -254,7 +338,7 @@ async def gen_music(deepseek_response, id, redis, db, user):
                         await f.write(audio_file.content)
                         await redis.hset(name=f"tasks:{id}", key="audio_url", value=f"/static/{fname}")
                             
-                        
+            
     except Exception as e:
         await redis.hset(name=f"tasks:{id}", key="status",value="failed")
         print(e)
@@ -274,16 +358,16 @@ async def gen_music(deepseek_response, id, redis, db, user):
             )
             await db.commit()
     
-async def get_response(input_prompt: Prompt, id, client, duration: str="15"):
+async def get_response(input_prompt: Prompt, id, client):
     prompt = input_prompt.model_dump()
     prompt["role"] = "user"
-    prompt["content"] += f" длительность{duration}"
+
     messages = [
         {"role": "system", "content": (
             "Ты — ассистент для генерации музыки. Пользователь описывает желаемую музыку. "
             "Твоя задача — создать строгий JSON со следующими полями:\n"
             "- optimized_prompt: детальное описание музыки на **английском языке**, чтобы ии генерации музыки точно понял, что от него хочет пользователь, "
-            "Опиши жанр, настроение, инструменты, темп.\n"
+            "Опиши жанр, текст песни, настроение, инструменты, темп.\n"
             "- lyrics: если пользователь явно указал слова для песни, напиши их с добавлением "
             "структурных тегов [intro], [verse], [chorus], [bridge], [outro] на английском. "
             "Если пользователь не дал текст (только инструментальное описание), "
@@ -293,7 +377,7 @@ async def get_response(input_prompt: Prompt, id, client, duration: str="15"):
             "- track_name: оригинальное название трека на английском.\n"
             "- cover_url_request: краткий поисковый запрос на английском для картинки-обложки "
             "(например, 'synthwave night city cover art').\n"
-            "- duration: длительность трека исходя из запроса\n\n"
+            "- duration: длительность трека, исходя из запроса пользователя, но не более 100сек и не менее 20сек\n\n"
             "Ответь **только** JSON-объектом с ключами: "
             "optimized_prompt, lyrics, color, genre, duration, track_name, cover_url_request."
         )},
@@ -311,12 +395,35 @@ async def get_response(input_prompt: Prompt, id, client, duration: str="15"):
     return deepseek_response
 
 
+async def check_sub(db=Depends(get_db), user=Depends(get_user)):
+    cursor = await db.execute("""SELECT billing_expire, billing_plan FROM users WHERE sub = ?""", (user,))
+    row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404)
+    exp = row[0]
+    plan = row[1]
+    exp = datetime.datetime.fromisoformat(exp)
+    
+    if exp < datetime.datetime.now(tz=timezone.utc):
+        if plan == "free":
+            await db.execute("""UPDATE users SET billing_expire = ? WHERE sub = ?""", (datetime.datetime.now(tz=timezone.utc) + datetime.timedelta(hours=7200), user))
+            await db.commit()
+        else:
+            plan = "free"
+            await db.execute("""UPDATE users SET billing_expire = ?, billing_plan = 'free' WHERE sub = ?""", (datetime.datetime.now(tz=timezone.utc) + datetime.timedelta(hours=7200), user))
+            await db.commit()
+    return plan
 
 
 @app.post("/api/generate")
-async def generate(background_tasks: BackgroundTasks, input_prompt: Prompt, duration: str="15", client=Depends(get_client), redis=Depends(get_redis), db=Depends(get_db), user=Depends(get_user)):
+@limiter.limit("5/minute")
+async def generate(request: Request, background_tasks: BackgroundTasks, input_prompt: Prompt, sub=Depends(check_sub), client=Depends(get_client), redis=Depends(get_redis), db=Depends(get_db), user=Depends(get_user)):
     task_id: str = str(uuid.uuid4())
-    response = await get_response(input_prompt, task_id, client, duration)
+    input_model = input_prompt.model
+    if sub == "free":
+        if input_model != 0:
+            raise HTTPException(status_code=503)
+    response = await get_response(input_prompt, task_id, client)
     meta = {
             "cover_url": response.get("cover_url"),
             "track_name": response.get("track_name"),
@@ -327,7 +434,7 @@ async def generate(background_tasks: BackgroundTasks, input_prompt: Prompt, dura
     await redis.hset(name=f"tasks:{task_id}", key="status", value="processing")
     await redis.hset(name=f"tasks:{task_id}", key="audio_url", value="") 
     await redis.hset(name=f"tasks:{task_id}", key="meta", value=json.dumps(meta)) 
-    background_tasks.add_task(gen_music, response, task_id, redis, db, user)
+    background_tasks.add_task(gen_music, response, task_id, input_model, redis, db, user)
     return {
         "task_id": task_id,
         "status": "processing",
@@ -348,7 +455,8 @@ async def return_status(task_id):
     raise HTTPException(status_code=404)
 
 @app.post("/auth/google/")
-async def google_auth(data: GoogleToken, db=Depends(get_db)):
+@limiter.limit("5/minute")
+async def google_auth(request: Request, data: GoogleToken, db=Depends(get_db)):
     token = data.token
     try:
         id_inf = id_token.verify_oauth2_token(token, requests.Request(), client_id)
@@ -360,10 +468,10 @@ async def google_auth(data: GoogleToken, db=Depends(get_db)):
     name = id_inf["name"]
     await db.execute(
         """
-        INSERT INTO users (sub, email, name, billing_plan)
-        SELECT ?, ?, ?, 'free' WHERE NOT EXISTS (
+        INSERT INTO users (sub, email, name, billing_plan, billing_expire)
+        SELECT ?, ?, ?, 'free', ? WHERE NOT EXISTS (
         SELECT 1 FROM users WHERE sub = ?) 
-        """, (user_id, email, name, user_id)
+        """, (user_id, email, name, (datetime.datetime.now(tz=timezone.utc) + datetime.timedelta(hours=7200)).isoformat(), user_id)
     )
 
     await db.commit()
@@ -379,7 +487,7 @@ async def google_auth(data: GoogleToken, db=Depends(get_db)):
     return {"status": "successful", "token": token}
 
 @app.get("/track", response_model=TrackResponse)
-async def get_track(id:str, db=Depends(get_db)):
+async def get_track(id:str, db=Depends(get_db), user=Depends(get_user)):
     cursor = await db.execute("""SELECT id,
                name,
                cover_url,
@@ -388,7 +496,7 @@ async def get_track(id:str, db=Depends(get_db)):
                is_liked,
                color,
                optimized_prompt,
-               track_url FROM tracks WHERE id = ?""", (id,))
+               track_url FROM tracks WHERE id = ? AND user_id = ?""", (id, user))
     track = await cursor.fetchone()
     if track:
         id, name, cover_url, user_id, genre, is_liked, color, optimized_prompt, track_url = track
@@ -404,7 +512,7 @@ async def get_track(id:str, db=Depends(get_db)):
             "track_url": track_url
         }
     raise HTTPException(status_code=404)
-@app.get("/tracks")
+@app.get("/tracks", response_model=list[TrackResponse])
 async def get_tracks(user=Depends(get_user), db=Depends(get_db)):
     cursor = await db.execute("""SELECT id,
                name,
@@ -474,9 +582,53 @@ async def delete_track(track_id: str, user=Depends(get_user), db=Depends(get_db)
 
 @app.get("/user/info")
 async def get_info(user=Depends(get_user), db=Depends(get_db)):
-    cursor = await db.execute("""SELECT * FROM users WHERE users.sub = ?""", (user,))
+    cursor = await db.execute("""SELECT sub, name, email, billing_plan FROM users WHERE users.sub = ?""", (user,))
     row = await cursor.fetchone()
     if row:
         sub,name,email,billing_plan = row
         return {"sub": sub, "email": email, "billing_plan": billing_plan, "name": name}
     raise HTTPException(status_code=404)
+
+@app.get("/subscribe")
+async def subscribe(user=Depends(get_user), redis: Redis=Depends(get_redis)):
+    proxy_req = f"http://{proxy}@196.19.120.153:8000"
+    async with httpx.AsyncClient(proxy=proxy_req) as http_client:
+        headers = {
+            "Crypto-Pay-Api-Token": os.getenv("C_TOKEN"),
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "asset": "USDT",
+            "amount": "7",
+            "description": "Premium",
+            "payload": user
+        }
+        url = "https://testnet-pay.crypt.bot/api/createInvoice"
+        result = await http_client.post(url, headers=headers, json=payload)
+        result = result.json()
+        if result.get("ok") == True:
+            await redis.set(user, "processing", 900)
+            return {"url": result.get("result")["bot_invoice_url"]}
+        raise HTTPException(status_code=500)
+
+@app.post("/cryptobot")
+async def webhook(request: Request, db=Depends(get_db), redis=Depends(get_redis)):
+    body_bytes = await request.body()
+    signature = request.headers.get("crypto-pay-api-signature")
+    import hashlib, hmac 
+    secret = hashlib.sha256(os.getenv("C_TOKEN").encode()).digest()
+    check_hash = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
+    if not signature or check_hash != signature:
+        raise HTTPException(status_code=403)
+    body = json.loads(body_bytes)
+    if body.get("update_type") == "invoice_paid":
+        await db.execute("""UPDATE users SET billing_plan = 'premium' WHERE sub = ?""", (body.get("payload")["payload"],))
+        await db.execute("""UPDATE users SET billing_expire = ? WHERE sub = ?""", ((datetime.datetime.now(tz=timezone.utc) + datetime.timedelta(hours=720)).isoformat(), body.get("payload")["payload"]))
+        await db.commit()
+        await redis.set(body.get("payload")["payload"], "paid")
+    else:
+        await redis.set(body.get("payload")["payload"], "not_paid")
+@app.get("/payment/status")
+async def status(user=Depends(get_user), redis=Depends(get_redis)):
+    status = await redis.get(user)
+    return status
