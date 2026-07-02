@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Depends, BackgroundTasks, Request, Header
+from fastapi import FastAPI, Depends, BackgroundTasks, Request, UploadFile
 import dotenv, os, uuid, httpx, json
 from pydantic import BaseModel
+from arq import create_pool
+from .broker import r_settings
 from openai import AsyncOpenAI
 from fastapi import HTTPException
 import datetime, jwt, base64
@@ -40,7 +42,6 @@ async def lifespan(app: FastAPI):
                name TEXT,
                email TEXT,
                balance FLOAT,
-               free_limit INTEGER,
                expire TIMESTAMP
     );"""
     )
@@ -67,9 +68,21 @@ async def lifespan(app: FastAPI):
                FOREIGN KEY (track_id) REFERENCES tracks(id)
     );"""
     )
+    await app.state.db.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+               id TEXT PRIMARY KEY,
+               user_id TEXT,
+               track_id TEXT,
+               text TEXT,
+               FOREIGN KEY (user_id) REFERENCES users(sub),
+               FOREIGN KEY (track_id) REFERENCES tracks(id)
+    );"""
+    )
+    app.state.arq_pool = await create_pool(r_settings)
     await app.state.db.commit()
     yield
     await app.state.db.close()
+    await app.state.arq_pool.close()
 
 def get_db(request: Request):
     return request.app.state.db
@@ -163,222 +176,7 @@ async def search(deepseek_response, id):
         print(repr(e))
         deepseek_response["cover_url"] = None
     return deepseek_response
-async def gen_music(deepseek_response, id, model, redis, db, user):
-    try:
-        if model == 0:
-            async with httpx.AsyncClient(timeout=210.0) as http_client:
-                payload = {
-                    "prompt": deepseek_response.get("optimized_prompt"),
-                    "audio_duration":  deepseek_response.get("duration"),
-                    "inference_steps": 8,
-                    "thinking": False,
-                    "use_cot_caption": False,
-                    "use_cot_language": False,
-                    "offload_to_cpu": True,
-                    "batch_size": 1,
-                    "audio_format": "wav"
-                }
-                url = "http://127.0.0.1:8001/release_task"
-            
-                request = await http_client.post(url, json=payload)
-                acestep_resp = request.json()
-                print(acestep_resp)
-                idd = acestep_resp["data"]["task_id"]
 
-                for _ in range(30):
-                    await asyncio.sleep(3)
-                    url = "http://127.0.0.1:8001/query_result"
-                    pld = {
-                        "task_id_list": [idd]
-                    }
-                    request = await http_client.post(url, json=pld)
-                    result = request.json()
-                    print(result)
-                    if result["data"][0]["status"] == 1:
-                        await redis.hset(name=f"tasks:{id}", key="audio_url", value=f"http://127.0.0.1:8001{json.loads(result['data'][0]['result'])[0]['file']}") 
-                        await redis.hset(name=f"tasks:{id}", key="status",value="saving")
-                        break
-                    elif result["data"][0]["status"] != 1:
-                        await redis.hset(name=f"tasks:{id}", key="status",value="processing")
-                        continue
-                else:
-                    await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                final_gen = await redis.hget(name=f"tasks:{id}", key="audio_url")
-                        
-                if final_gen:
-                    format = ".wav" if ".wav" in final_gen else ".mp3"
-                    audio_file = await http_client.get(final_gen, follow_redirects=True)
-                    if audio_file.status_code == 200:
-                        fname = f"{id}{format}"
-                        fpath = os.path.join("static", fname)
-                        async with aiofiles.open(fpath, "wb") as f:
-                            await f.write(audio_file.content)
-                            await redis.hset(name=f"tasks:{id}", key="audio_url", value=f"/static/{fname}")
-                            await redis.hset(name=f"tasks:{id}", key="status",value="success")
-                
-        
-        else:
-            proxy_req = f"http://{proxy}@196.19.120.153:8000"
-            async with httpx.AsyncClient(timeout=210.0, proxy=proxy_req) as http_client:
-                
-                if model == 1:
-                    headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {minimax_api_key1}"
-                    }
-                    payload = {
-                    "prompt": deepseek_response.get("optimized_prompt"),
-                    "lyrics_prompt": deepseek_response.get("lyrics"),
-                    "model": "v2.0",
-                    "sample_rate": "44100",
-                    "bitrate": "256000",
-                    "format": "mp3",
-                    "translate_input": False
-                    }
-                    url = "https://api.gen-api.ru/api/v1/networks/minimax-music"
-            
-                    request = await http_client.post(url, headers=headers, json=payload)
-                    minimax_response = request.json()
-                    print(request.status_code)
-                    print(minimax_response)
-                    
-                    if request.status_code != 200:
-                        await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                        await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                    else:
-                        mm_task_id = minimax_response.get("request_id")
-                        url_status = f"https://api.gen-api.ru/api/v1/request/get/{mm_task_id}"
-                        for _ in range(20):
-                            await asyncio.sleep(5)
-                            request = await http_client.get(url_status, headers=headers)
-                            minimax_response = request.json()
-                            if minimax_response.get("status") == "success":
-                                if minimax_response.get("result") and isinstance(minimax_response.get("result"), list):
-                                    await redis.hset(name=f"tasks:{id}", key="audio_url", value=minimax_response.get("result")[0])
-                                    await redis.hset(name=f"tasks:{id}", key="status",value="saving")
-                                    print(minimax_response)
-                                    break
-                            elif request.status_code != 200:
-                                print(request.status_code)
-                                print(minimax_response)
-                                await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                                await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                                return
-                        else:
-                            await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                            return
-                        
-                elif model == 2:
-                    headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {minimax_api_key}"
-                    }
-                    payload = {
-                    "model": "music-2.6",
-                    "prompt": deepseek_response.get("optimized_prompt"),
-                    "lyrics": deepseek_response.get("lyrics"),
-                    "output_format": "url",
-                    "audio_settings": {
-                        "sample_rate": 44100,
-                        "bitrate": 256000,
-                        "format": "mp3",
-                        "translate_input": False
-                        }
-                    }
-                    url = "https://api.minimax.io/v1/music_generation"
-            
-                    request = await http_client.post(url, headers=headers, json=payload)
-                    minimax_response = request.json()
-                    print(request.status_code)
-                    print(minimax_response)
-                    
-                    if request.status_code != 200:
-                        await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                        await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                        return
-                    else:
-                        
-                        if minimax_response.get("data")["status"] == 2:
-                            await redis.hset(name=f"tasks:{id}", key="audio_url", value=minimax_response.get("data")["audio"])
-                            await redis.hset(name=f"tasks:{id}", key="status",value="saving")
-                            
-                        else:
-                            await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                            await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                elif model == 3:
-                    headers = {
-                    "Authorization": f"Bearer {replicate}",
-                    "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "input": {
-                            "prompt": deepseek_response.get("optimized_prompt")
-                        }
-                    }
-                    url = "https://api.replicate.com/v1/models/google/lyria-3-pro/predictions"
-                    request = await http_client.post(url, headers=headers, json=payload)
-                    lyr_response = request.json()
-                    print(request.status_code)
-                    print(lyr_response)
-                    
-                    if request.status_code != 200 and request.status_code != 201:
-                        await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                        await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                    else:
-                        l_task_id = lyr_response.get("id")
-                        url_status = f"https://api.replicate.com/v1/predictions/{l_task_id}"
-                        for _ in range(20):
-                            await asyncio.sleep(5)
-                            request = await http_client.get(url_status, headers=headers)
-                            lyr_response = request.json()
-                            if lyr_response.get("status") == "succeeded":
-                                await redis.hset(name=f"tasks:{id}", key="audio_url", value=lyr_response.get("output"))
-                                await redis.hset(name=f"tasks:{id}", key="status",value="saving")
-                                print(lyr_response)
-                                break
-                            elif request.status_code != 200 and request.status_code != 201:
-                                print(request.status_code)
-                                print(lyr_response)
-                                await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                                await redis.hset(name=f"tasks:{id}", key="audio_url", value="") 
-                                return
-                        else:
-                            await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-                            return
-                final_gen = await redis.hget(name=f"tasks:{id}", key="audio_url")
-                        
-                if final_gen:
-                    format = ".wav" if ".wav" in final_gen else ".mp3"
-                    audio_file = await http_client.get(final_gen, follow_redirects=True)
-                    if audio_file.status_code == 200:
-                        fname = f"{id}{format}"
-                        fpath = os.path.join("static", fname)
-                        async with aiofiles.open(fpath, "wb") as f:
-                            await f.write(audio_file.content)
-                            await redis.hset(name=f"tasks:{id}", key="audio_url", value=f"/static/{fname}")
-                            await redis.hset(name=f"tasks:{id}", key="status",value="success")
-            
-                        
-            
-    except Exception as e:
-        await redis.hset(name=f"tasks:{id}", key="status",value="failed")
-        print(e)
-    
-    data = await redis.hgetall(f"tasks:{id}")
-    await redis.expire(f"tasks:{id}", 3000)
-    if data:
-        data["meta"] = json.loads(data["meta"])
-        task = TaskStatusResponse.model_validate(data)
-        task =  task.model_dump()
-        if task["status"] == "success":
-            await db.execute("""
-            INSERT INTO tracks (id, user_id, name, cover_url, genre, color, track_url, optimized_prompt) SELECT
-            ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE id = ?)
-
-            """, (id, user, task["meta"]["track_name"], task["meta"]["cover_url"], task["meta"]["genre"], task["meta"]["color"], task["audio_url"], task["meta"]["optimized_prompt"], id)
-            )
-            await db.commit()
-    
 async def get_response(input_prompt: Prompt, id, client):
     prompt = input_prompt.model_dump()
     prompt["role"] = "user"
@@ -417,44 +215,31 @@ async def get_response(input_prompt: Prompt, id, client):
 
 
 async def check_sub(db, user, model):
-    cursor = await db.execute("""SELECT balance, free_limit, expire FROM users WHERE sub = ?""", (user,))
+    cursor = await db.execute("""SELECT balance FROM users WHERE sub = ?""", (user,))
     row = await cursor.fetchone()
     if not row:
         raise HTTPException(status_code=404)
     balance = float(row[0])
-    limit = int(row[1])
-    expire = datetime.datetime.fromisoformat(row[2])
+
     
-    if model != 0:
-        if model in (1, 2):
-            if balance >= 0.15:
-                await db.execute("""UPDATE users SET balance = balance - ? WHERE sub = ?""", (0.15, user))
-                await db.commit()
-                return True
-            return False
+    if model in (1, 2):
+        if balance >= 0.16:
+            await db.execute("""UPDATE users SET balance = balance - ? WHERE sub = ?""", (0.16, user))
+            await db.commit()
+            return True
+        return False
     
-        else:
-            if balance >= 0.1:
-                await db.execute("""UPDATE users SET balance = balance - ? WHERE sub = ?""", (0.1, user))
-                await db.commit()
-                return True 
-            return False
-    
-    if expire < datetime.datetime.now(tz=timezone.utc):
-        await db.execute("""UPDATE users SET expire = ?, free_limit = ? WHERE sub = ?""", ((datetime.datetime.now(tz=timezone.utc) + datetime.timedelta(hours=3)).isoformat(), 10, user))
-        await db.commit()
-        return True
-    elif limit == 0:
-        return False 
     else:
-        await db.execute("""UPDATE users SET free_limit = free_limit - ? WHERE sub = ?""", (1, user))
-        await db.commit()
-        return True
+        if balance >= 0.1:
+            await db.execute("""UPDATE users SET balance = balance - ? WHERE sub = ?""", (0.1, user))
+            await db.commit()
+            return True 
+        return False
 
 
 @app.post("/api/generate")
 @limiter.limit("5/minute")
-async def generate(request: Request, background_tasks: BackgroundTasks, input_prompt: Prompt, client=Depends(get_client), redis=Depends(get_redis), db=Depends(get_db), user=Depends(get_user)):
+async def generate(request: Request, input_prompt: Prompt, client=Depends(get_client), redis=Depends(get_redis), db=Depends(get_db), user=Depends(get_user)):
     task_id: str = str(uuid.uuid4())
     input_model = input_prompt.model
     sub = await check_sub(db, user, input_model)
@@ -471,7 +256,7 @@ async def generate(request: Request, background_tasks: BackgroundTasks, input_pr
     await redis.hset(name=f"tasks:{task_id}", key="status", value="processing")
     await redis.hset(name=f"tasks:{task_id}", key="audio_url", value="") 
     await redis.hset(name=f"tasks:{task_id}", key="meta", value=json.dumps(meta)) 
-    background_tasks.add_task(gen_music, response, task_id, input_model, redis, db, user)
+    await request.app.state.arq_pool.enqueue_job("gen_music", response, task_id, input_model, user, proxy, minimax_api_key, minimax_api_key1, replicate, TaskStatusResponse)
     return {
         "task_id": task_id,
         "status": "processing",
@@ -505,10 +290,10 @@ async def google_auth(request: Request, data: GoogleToken, db=Depends(get_db)):
     name = id_inf["name"]
     await db.execute(
         """
-        INSERT INTO users (sub, email, name, balance, free_limit, expire)
+        INSERT INTO users (sub, email, name, balance)
         SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
         SELECT 1 FROM users WHERE sub = ?) 
-        """, (user_id, email, name, 0.0, 10, (datetime.datetime.now(tz=timezone.utc) + datetime.timedelta(hours=3)).isoformat(), user_id)
+        """, (user_id, email, name, 0.0, user_id)
     )
 
     await db.commit()
@@ -621,12 +406,11 @@ async def delete_track(track_id: str, user=Depends(get_user), db=Depends(get_db)
 
 @app.get("/user/info")
 async def get_info(user=Depends(get_user), db=Depends(get_db)):
-    cursor = await db.execute("""SELECT sub, name, email, balance, free_limit, expire FROM users WHERE users.sub = ?""", (user,))
+    cursor = await db.execute("""SELECT sub, name, email, balance FROM users WHERE users.sub = ?""", (user,))
     row = await cursor.fetchone()
     if row:
-        sub,name,email,balance, free_limit, expire = row
-        expire = datetime.datetime.fromisoformat(expire)
-        return {"sub": sub, "email": email, "balance": balance, "name": name, "free-limit": free_limit, "expire": expire}
+        sub,name,email,balance = row
+        return {"sub": sub, "email": email, "balance": balance, "name": name}
     raise HTTPException(status_code=404)
 
 @app.get("/pay")
@@ -637,17 +421,19 @@ async def subscribe(sum: int, user=Depends(get_user), redis: Redis=Depends(get_r
             "Crypto-Pay-Api-Token": os.getenv("C_TOKEN"),
             "Content-Type": "application/json"
         }
+        id = str(uuid.uuid4())
         payload = {
             "asset": "USDT",
             "amount": str(sum),
             "description": "payment",
-            "payload": user
+            "payload": id
         }
         url = "https://testnet-pay.crypt.bot/api/createInvoice"
         result = await http_client.post(url, headers=headers, json=payload)
         result = result.json()
         if result.get("ok") == True:
-            await redis.set(user, "processing", 900)
+            await redis.hset(name=id, mapping={"status":"processing", "user": user})
+            await redis.hexpire(name=id, time=900)
             return {"url": result.get("result")["bot_invoice_url"]}
         raise HTTPException(status_code=500)
 
@@ -662,6 +448,7 @@ async def webhook(request: Request, db=Depends(get_db), redis=Depends(get_redis)
         raise HTTPException(status_code=403)
     body = json.loads(body_bytes)
     if body.get("update_type") == "invoice_paid":
+        user = await redis.hget(name=body.get("payload")["payload"], key="user")
         await db.execute("""UPDATE users SET balance = balance + ? WHERE sub = ?""", (body.get("payload")["amount"], body.get("payload")["payload"],))
         await db.commit()
         await redis.set(body.get("payload")["payload"], "paid")
@@ -671,3 +458,41 @@ async def webhook(request: Request, db=Depends(get_db), redis=Depends(get_redis)
 async def status(user=Depends(get_user), redis=Depends(get_redis)):
     status = await redis.get(user)
     return status
+class TrackNameScheme(BaseModel):
+    new_tack_name: str 
+@app.patch("/upd/track/name")
+async def update_track_name(new_track: TrackNameScheme, track_id, db=Depends(get_db), user=Depends(get_user)):
+    name = new_track.new_tack_name
+    await db.execute("""
+        UPDATE tracks SET name = ? WHERE id = ? and user_id = ? 
+    """, (name, track_id, user))
+    await db.commit()
+    return {"status": "successful"}
+@app.patch("/upd/track/cut")
+async def get_cut_track(file: UploadFile, track_id: str, db=Depends(get_db), user=Depends(get_user)):
+    if file.content_type == "audio/mpeg" and file:
+        path = os.path.join("static", file.filename)
+        async with aiofiles.open(path, "wb") as f:
+            await f.write((await file.read()))
+        await db.execute("""UPDATE tracks SET audio_url = ? WHERE id = ? AND user_id = ?""", (path, track_id, user))
+        return {"status": "successful"}
+    raise HTTPException(status_code=502)
+class PostSchema(BaseModel):
+    text: str
+@app.post("/track/post")
+async def create_post(post: PostSchema, track_id: str, db=Depends(get_db), user=Depends(get_user)):
+    text = post.text
+    await db.execute("""INSERT INTO posts (id, user_id, text, track_id) SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM posts WHERE track_id = ?)""", (uuid.uuid4(), user, text, track_id, track_id))
+    await db.commit()
+    return {"status": "successful"}
+@app.patch("/track/post/update")
+async def update_post(post: PostSchema, post_id: str, db=Depends(get_db), user=Depends(get_user)):
+    text = post.text 
+    await db.execute("""UPDATE posts SET text = ? WHERE id = ? AND user_id = ?""", (text, post_id, user))
+    await db.commit
+    return {"status": "successful"}
+@app.delete("/track/post/delete")
+async def delete_post(post_id, db=Depends(get_db), user=Depends(get_user)):
+    await db.execute("""DELETE FROM posts WHERE id = ? AND user_id = ?""", (post_id, user))
+    await db.commit
+    return {"status": "successful"}
